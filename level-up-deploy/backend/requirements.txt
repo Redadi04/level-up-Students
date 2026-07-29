@@ -1,0 +1,10 @@
+flask
+flask-cors
+gunicorn
+python-dotenv
+itsdangerous
+psycopg2-binary
+langchain
+langchain-groq
+langgraph
+pydantic
