@@ -5,6 +5,11 @@ Q&A sessions (post questions + a skill profile), students take sessions and
 build a resume/skill guide targeted at whichever company they pick. Grading
 runs through a LangChain + LangGraph pipeline.
 
+**Storage:** Postgres, hosted on Supabase (free tier) — not CSV files. This
+means accounts, questions, and results all survive Render restarts, redeploys,
+and free-tier spin-downs, since the database is a separate service unaffected
+by what happens to the backend's own filesystem.
+
 ## Routes
 
 **Auth**
@@ -17,12 +22,18 @@ runs through a LangChain + LangGraph pipeline.
 - `PUT  /api/companies/me` — company only — update `recommended_skills`
 
 **Questions (a company's hosted session)**
-- `GET  /api/questions?company_id=...` — that company's question ladder
+- `GET  /api/questions?company_id=...` — that company's *active* question ladder (public)
+- `GET  /api/questions/mine` — company only — every question you've added, active or not
 - `POST /api/questions` — company only — add a question to your own bank
+- `PATCH /api/questions/<id>` — company only — `{active: true/false}`, toggles a question without deleting it
 
 **Interview + results**
-- `POST /api/evaluate` — student only — grade an answer, logs the attempt
+- `POST /api/evaluate` — student only — grade an answer, logs the attempt.
+  Enforces sequential unlocking server-side: a level can't be attempted until
+  every earlier level for that company has a logged pass.
 - `GET  /api/results` — company only — every attempt against your questions
+- `GET  /api/my-results?company_id=...` — student only — your own attempt
+  history with one company (used to resume at the right level)
 
 **Growth (company-aware)**
 - `POST /api/skill-guide` — student only — `{company_id}` → study guide
@@ -34,15 +45,35 @@ Auth uses signed tokens (`itsdangerous`), not cookies — sent as
 `Authorization: Bearer <token>`. This avoids cross-site cookie issues between
 a Vercel frontend and a Render backend.
 
+## One-time setup: create the Supabase database
+
+1. Go to https://supabase.com → sign up (free, no card needed) → **New project**.
+2. Pick a name/region/password (save the password somewhere — you'll need it
+   in the connection string).
+3. Once it's created, go to **Project Settings → Database → Connection string**.
+4. Select the **"Transaction pooler"** tab (port `6543`) — this pooled
+   connection is what works reliably from Render's free tier.
+5. Copy that URI — it looks like:
+   ```
+   postgresql://postgres.xxxxx:[YOUR-PASSWORD]@aws-0-region.pooler.supabase.com:6543/postgres
+   ```
+6. Replace `[YOUR-PASSWORD]` with the real password you set in step 2.
+
+That full string is your `DATABASE_URL`. The app creates its own tables
+automatically the first time it starts up — nothing to run manually in
+Supabase's SQL editor.
+
 ## Local development
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env       # then paste in your real Groq key
+cp .env.example .env       # then paste in your real Groq key AND your Supabase DATABASE_URL
 python app.py
 ```
 
-Runs at `http://localhost:5000`.
+Runs at `http://localhost:5000`. On first run, check the terminal for any
+database connection errors — a wrong password or connection string is the
+most common issue here.
 
 ## Deploying to Render
 
@@ -57,6 +88,7 @@ Runs at `http://localhost:5000`.
    - `GROQ_API_KEY` = your real key (free from https://console.groq.com/keys)
    - `GROQ_MODEL` = `llama-3.3-70b-versatile` (optional, this is the default)
    - `PASS_THRESHOLD` = `70` (optional, this is the default)
+   - `DATABASE_URL` = your Supabase connection string from the setup above
    - `FRONTEND_URL` = your Vercel URL once you have it (can add this after
      the first deploy)
 6. Click **Create Web Service**. Render gives you a URL like
@@ -66,15 +98,13 @@ Runs at `http://localhost:5000`.
 There's also a `render.yaml` in this folder if you'd rather use Render's
 "Blueprint" import instead of clicking through the UI manually.
 
-## Important: storage caveat on Render's free tier
+## Why this fixes the earlier data-loss problem
 
-`questions.csv`, `results.csv`, and `users.csv` (accounts + password hashes)
-live on local disk in the `data/` folder. **On Render's free tier, this disk
-is wiped on every redeploy and on periodic restarts** — meaning accounts
-would disappear too. This is fine for testing, but for a real deployment
-you'll want either:
-- A Render **persistent disk** (paid, keeps `data/` between deploys), or
-- Swapping the CSV storage for a proper database (Render's free Postgres
-  tier is a natural next step)
+Render's free-tier filesystem is ephemeral — any changes to your web
+service's filesystem are lost every time the service redeploys, restarts, or
+spins down, and free instances spin down after 15 minutes of inactivity.
+That's why CSV files stored on Render's own disk kept disappearing. Supabase's
+database lives on entirely separate infrastructure, so it's untouched by
+Render restarting, redeploying, or spinning down — your accounts, questions,
+and results now persist indefinitely.
 
-Happy to help wire up either one when you're ready to make it permanent.

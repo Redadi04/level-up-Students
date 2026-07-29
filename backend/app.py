@@ -1,30 +1,28 @@
 # app.py
 # Level-Up Interview — Flask API backend (deploys to Render)
 #
-# Now includes:
-#   - Company + student accounts (signup/login, token-based auth)
-#   - Company skill profiles ("recommended skills for this role")
-#   - A LangChain + LangGraph grading pipeline (unchanged from before)
-#   - A skill guide + resume builder that both take the student's *chosen
-#     target company* into account, using that company's recommended skills
-#     alongside the student's actual interview performance
+# Storage: Postgres (Supabase), via psycopg2 — replaces the earlier CSV-file
+# approach. Render's free-tier filesystem is ephemeral (wiped on every
+# restart/redeploy/spin-down), but this database is a separate hosted service
+# and is unaffected by that — accounts, questions, and results now persist
+# regardless of what Render's backend instance does.
 #
-# Auth: simple signed tokens (itsdangerous), not cookies — this avoids
-# cross-site cookie headaches between a Vercel frontend and a Render backend.
-# The frontend sends the token back as "Authorization: Bearer <token>".
+# Grading: LangChain + LangGraph, backed by Groq (unchanged from before).
 
 import os
-import csv
 import uuid
 from datetime import datetime
-from functools import wraps
 from typing import TypedDict
+from contextlib import contextmanager
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
+import psycopg2
+import psycopg2.extras
 
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
@@ -50,45 +48,66 @@ TOKEN_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 PASS_THRESHOLD = int(os.environ.get("PASS_THRESHOLD", "70"))
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-USERS_FILE = os.path.join(DATA_DIR, "users.csv")
-QUESTIONS_FILE = os.path.join(DATA_DIR, "questions.csv")
-RESULTS_FILE = os.path.join(DATA_DIR, "results.csv")
-
-USER_FIELDS = ["id", "role", "name", "email", "password_hash", "company_name", "recommended_skills", "created_at"]
-QUESTION_FIELDS = ["id", "company_id", "level", "question", "expected_answer", "active"]
-RESULT_FIELDS = [
-    "id", "timestamp", "student_id", "candidate_name", "company_id",
-    "level", "question", "candidate_answer", "score", "passed", "feedback",
-]
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
-# ---------- small CSV helpers (no database needed) ----------
+# ---------- database helpers ----------
 
-def read_csv_rows(path, fields):
-    if not os.path.exists(path):
-        return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+@contextmanager
+def get_cursor(commit=False):
+    """Opens a fresh connection per call — simplest reliable approach for a
+    small app like this. Commits on success, rolls back on error, always
+    closes the connection."""
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set on the server.")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                yield cur
+    finally:
+        conn.close()
 
 
-def append_csv_row(path, fields, row):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    file_exists = os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def write_csv_rows(path, fields, rows):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+def init_db():
+    with get_cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                company_name TEXT DEFAULT '',
+                recommended_skills TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS questions (
+                id TEXT PRIMARY KEY,
+                company_id TEXT NOT NULL REFERENCES users(id),
+                level INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                expected_answer TEXT NOT NULL,
+                active BOOLEAN DEFAULT TRUE
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                id TEXT PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT NOW(),
+                student_id TEXT NOT NULL REFERENCES users(id),
+                candidate_name TEXT,
+                company_id TEXT NOT NULL REFERENCES users(id),
+                level INTEGER,
+                question TEXT,
+                candidate_answer TEXT,
+                score INTEGER,
+                passed BOOLEAN,
+                feedback TEXT
+            )
+        """)
 
 
 # ---------- auth helpers ----------
@@ -106,17 +125,15 @@ def verify_token(token):
 
 
 def find_user_by_id(user_id):
-    for u in read_csv_rows(USERS_FILE, USER_FIELDS):
-        if u["id"] == user_id:
-            return u
-    return None
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+        return cur.fetchone()
 
 
 def find_user_by_email(email):
-    for u in read_csv_rows(USERS_FILE, USER_FIELDS):
-        if u["email"].lower() == email.lower():
-            return u
-    return None
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE email = %s", (email.lower(),))
+        return cur.fetchone()
 
 
 def public_user(u):
@@ -125,13 +142,15 @@ def public_user(u):
         "role": u["role"],
         "name": u["name"],
         "email": u["email"],
-        "company_name": u.get("company_name", ""),
-        "recommended_skills": u.get("recommended_skills", ""),
+        "company_name": u.get("company_name") or "",
+        "recommended_skills": u.get("recommended_skills") or "",
     }
 
 
 def require_auth(role=None):
     def decorator(fn):
+        from functools import wraps
+
         @wraps(fn)
         def wrapper(*args, **kwargs):
             auth_header = request.headers.get("Authorization", "")
@@ -257,19 +276,20 @@ def signup():
     if find_user_by_email(email):
         return jsonify({"error": "An account with that email already exists."}), 409
 
-    user = {
-        "id": uuid.uuid4().hex,
-        "role": role,
-        "name": name,
-        "email": email,
-        "password_hash": generate_password_hash(password),
-        "company_name": company_name if role == "company" else "",
-        "recommended_skills": recommended_skills if role == "company" else "",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    append_csv_row(USERS_FILE, USER_FIELDS, user)
+    user_id = uuid.uuid4().hex
+    with get_cursor() as cur:
+        cur.execute(
+            """INSERT INTO users (id, role, name, email, password_hash, company_name, recommended_skills)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                user_id, role, name, email, generate_password_hash(password),
+                company_name if role == "company" else "",
+                recommended_skills if role == "company" else "",
+            ),
+        )
 
-    token = make_token(user["id"])
+    user = find_user_by_id(user_id)
+    token = make_token(user_id)
     return jsonify({"token": token, "user": public_user(user)}), 201
 
 
@@ -297,12 +317,13 @@ def me():
 
 @app.route("/api/companies", methods=["GET"])
 def list_companies():
-    users = read_csv_rows(USERS_FILE, USER_FIELDS)
-    companies = [
-        {"id": u["id"], "company_name": u["company_name"], "recommended_skills": u.get("recommended_skills", "")}
-        for u in users if u["role"] == "company"
-    ]
-    return jsonify(companies)
+    with get_cursor() as cur:
+        cur.execute("SELECT id, company_name, recommended_skills FROM users WHERE role = 'company'")
+        rows = cur.fetchall()
+    return jsonify([
+        {"id": r["id"], "company_name": r["company_name"], "recommended_skills": r["recommended_skills"] or ""}
+        for r in rows
+    ])
 
 
 @app.route("/api/companies/me", methods=["PUT"])
@@ -312,14 +333,11 @@ def update_my_company():
     company_name = data.get("company_name")
     recommended_skills = data.get("recommended_skills")
 
-    users = read_csv_rows(USERS_FILE, USER_FIELDS)
-    for u in users:
-        if u["id"] == g.user["id"]:
-            if company_name is not None:
-                u["company_name"] = company_name.strip()
-            if recommended_skills is not None:
-                u["recommended_skills"] = recommended_skills.strip()
-    write_csv_rows(USERS_FILE, USER_FIELDS, users)
+    with get_cursor() as cur:
+        if company_name is not None:
+            cur.execute("UPDATE users SET company_name = %s WHERE id = %s", (company_name.strip(), g.user["id"]))
+        if recommended_skills is not None:
+            cur.execute("UPDATE users SET recommended_skills = %s WHERE id = %s", (recommended_skills.strip(), g.user["id"]))
 
     updated = find_user_by_id(g.user["id"])
     return jsonify(public_user(updated))
@@ -335,27 +353,25 @@ def get_questions():
     if not company_id:
         return jsonify({"error": "company_id query parameter is required."}), 400
 
-    rows = [
-        r for r in read_csv_rows(QUESTIONS_FILE, QUESTION_FIELDS)
-        if r["company_id"] == company_id and str(r.get("active", "true")).strip().lower() == "true"
-    ]
-    for r in rows:
-        r["level"] = int(r["level"])
-    rows.sort(key=lambda r: r["level"])
-    return jsonify(rows)
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM questions WHERE company_id = %s AND active = TRUE ORDER BY level",
+            (company_id,),
+        )
+        rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/questions/mine", methods=["GET"])
 @require_auth(role="company")
 def get_my_questions():
-    # Company's own view: every question they've ever added, active or not,
-    # so they can see and manage what's currently live.
-    rows = [r for r in read_csv_rows(QUESTIONS_FILE, QUESTION_FIELDS) if r["company_id"] == g.user["id"]]
-    for r in rows:
-        r["level"] = int(r["level"])
-        r["active"] = str(r.get("active", "true")).strip().lower() == "true"
-    rows.sort(key=lambda r: r["level"])
-    return jsonify(rows)
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM questions WHERE company_id = %s ORDER BY level",
+            (g.user["id"],),
+        )
+        rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/questions", methods=["POST"])
@@ -369,16 +385,18 @@ def add_question():
     if not level or not question or not expected_answer:
         return jsonify({"error": "level, question, and expected_answer are required."}), 400
 
-    row = {
-        "id": uuid.uuid4().hex,
-        "company_id": g.user["id"],
-        "level": int(level),
-        "question": question,
-        "expected_answer": expected_answer,
-        "active": "true",
-    }
-    append_csv_row(QUESTIONS_FILE, QUESTION_FIELDS, row)
-    return jsonify(row), 201
+    question_id = uuid.uuid4().hex
+    with get_cursor() as cur:
+        cur.execute(
+            """INSERT INTO questions (id, company_id, level, question, expected_answer, active)
+               VALUES (%s, %s, %s, %s, %s, TRUE)""",
+            (question_id, g.user["id"], int(level), question, expected_answer),
+        )
+
+    return jsonify({
+        "id": question_id, "company_id": g.user["id"], "level": int(level),
+        "question": question, "expected_answer": expected_answer, "active": True,
+    }), 201
 
 
 @app.route("/api/questions/<question_id>", methods=["PATCH"])
@@ -391,58 +409,44 @@ def set_question_active(question_id):
     if active is None:
         return jsonify({"error": "active (true/false) is required."}), 400
 
-    rows = read_csv_rows(QUESTIONS_FILE, QUESTION_FIELDS)
-    found = None
-    for r in rows:
-        r.setdefault("active", "true")
-        if r["id"] == question_id:
-            if r["company_id"] != g.user["id"]:
-                return jsonify({"error": "You can only manage your own questions."}), 403
-            r["active"] = "true" if active else "false"
-            found = r
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM questions WHERE id = %s", (question_id,))
+        existing = cur.fetchone()
+        if not existing:
+            return jsonify({"error": "Question not found."}), 404
+        if existing["company_id"] != g.user["id"]:
+            return jsonify({"error": "You can only manage your own questions."}), 403
 
-    if not found:
-        return jsonify({"error": "Question not found."}), 404
+        cur.execute("UPDATE questions SET active = %s WHERE id = %s", (bool(active), question_id))
 
-    write_csv_rows(QUESTIONS_FILE, QUESTION_FIELDS, rows)
-    found["level"] = int(found["level"])
-    found["active"] = active
-    return jsonify(found)
+    updated = dict(existing)
+    updated["active"] = bool(active)
+    return jsonify(updated)
 
 
 # ---------- evaluate ----------
-
-def active_levels_for_company(company_id):
-    """Distinct active levels for a company, in ascending order — used to
-    decide what candidates can currently see/attempt."""
-    rows = read_csv_rows(QUESTIONS_FILE, QUESTION_FIELDS)
-    levels = {
-        int(r["level"]) for r in rows
-        if r["company_id"] == company_id and str(r.get("active", "true")).strip().lower() == "true"
-    }
-    return sorted(levels)
-
 
 def all_levels_for_company(company_id):
     """Every level a company has ever created, active or not. Used for the
     prerequisite check — deactivating level 1 shouldn't let someone who never
     passed it skip straight to level 2."""
-    rows = read_csv_rows(QUESTIONS_FILE, QUESTION_FIELDS)
-    levels = {int(r["level"]) for r in rows if r["company_id"] == company_id}
-    return sorted(levels)
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT level FROM questions WHERE company_id = %s ORDER BY level",
+            (company_id,),
+        )
+        return [r["level"] for r in cur.fetchall()]
 
 
 def student_passed_level(student_id, company_id, level):
-    """Has this student already logged a passing attempt at this level for this company?"""
-    for r in read_csv_rows(RESULTS_FILE, RESULT_FIELDS):
-        if (
-            r["student_id"] == student_id
-            and r["company_id"] == company_id
-            and str(r["level"]) == str(level)
-            and str(r["passed"]).strip().lower() == "true"
-        ):
-            return True
-    return False
+    with get_cursor() as cur:
+        cur.execute(
+            """SELECT 1 FROM results
+               WHERE student_id = %s AND company_id = %s AND level = %s AND passed = TRUE
+               LIMIT 1""",
+            (student_id, company_id, level),
+        )
+        return cur.fetchone() is not None
 
 
 @app.route("/api/evaluate", methods=["POST"])
@@ -460,16 +464,12 @@ def evaluate():
 
     level = int(level)
 
-    # Enforce sequential unlocking: every earlier active level for this company
-    # must already be passed by this student before they can attempt this one.
-    # This is checked server-side (not just hidden in the UI) using the same
-    # Groq-graded "passed" verdict already logged for each attempt.
+    # Enforce sequential unlocking server-side using the same pass/fail
+    # history Groq already produced for earlier levels.
     earlier_levels = [lv for lv in all_levels_for_company(company_id) if lv < level]
     for lv in earlier_levels:
         if not student_passed_level(g.user["id"], company_id, lv):
-            return jsonify({
-                "error": f"You need to pass level {lv} before attempting level {level}."
-            }), 403
+            return jsonify({"error": f"You need to pass level {lv} before attempting level {level}."}), 403
 
     if not os.environ.get("GROQ_API_KEY"):
         return jsonify({"error": "GROQ_API_KEY is not set on the server."}), 500
@@ -479,19 +479,16 @@ def evaluate():
     except Exception as e:
         return jsonify({"error": f"Grading pipeline failed: {e}"}), 502
 
-    append_csv_row(RESULTS_FILE, RESULT_FIELDS, {
-        "id": uuid.uuid4().hex,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "student_id": g.user["id"],
-        "candidate_name": g.user["name"],
-        "company_id": company_id,
-        "level": level,
-        "question": question,
-        "candidate_answer": candidate_answer,
-        "score": verdict["score"],
-        "passed": verdict["passed"],
-        "feedback": verdict["feedback"],
-    })
+    with get_cursor() as cur:
+        cur.execute(
+            """INSERT INTO results
+               (id, student_id, candidate_name, company_id, level, question, candidate_answer, score, passed, feedback)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                uuid.uuid4().hex, g.user["id"], g.user["name"], company_id, level,
+                question, candidate_answer, verdict["score"], verdict["passed"], verdict["feedback"],
+            ),
+        )
 
     return jsonify(verdict)
 
@@ -499,31 +496,40 @@ def evaluate():
 @app.route("/api/results", methods=["GET"])
 @require_auth(role="company")
 def get_results():
-    rows = [r for r in read_csv_rows(RESULTS_FILE, RESULT_FIELDS) if r["company_id"] == g.user["id"]]
-    return jsonify(rows)
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM results WHERE company_id = %s ORDER BY timestamp DESC",
+            (g.user["id"],),
+        )
+        rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/my-results", methods=["GET"])
 @require_auth(role="student")
 def get_my_results():
-    # So the candidate UI can skip levels this student already passed,
-    # instead of making them retake a level every time they come back.
     company_id = request.args.get("company_id")
     if not company_id:
         return jsonify({"error": "company_id query parameter is required."}), 400
 
-    rows = [
-        r for r in read_csv_rows(RESULTS_FILE, RESULT_FIELDS)
-        if r["student_id"] == g.user["id"] and r["company_id"] == company_id
-    ]
-    return jsonify(rows)
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM results WHERE student_id = %s AND company_id = %s ORDER BY timestamp",
+            (g.user["id"], company_id),
+        )
+        rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 # ---------- skill guide + resume builder (company-aware) ----------
 
 def student_results_for_company(student_id, company_id):
-    rows = read_csv_rows(RESULTS_FILE, RESULT_FIELDS)
-    return [r for r in rows if r["student_id"] == student_id and r["company_id"] == company_id]
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM results WHERE student_id = %s AND company_id = %s ORDER BY level",
+            (student_id, company_id),
+        )
+        return cur.fetchall()
 
 
 @app.route("/api/skill-guide", methods=["POST"])
@@ -543,14 +549,13 @@ def skill_guide():
     if attempts:
         lines = []
         for r in attempts:
-            passed = str(r["passed"]).strip().lower() == "true"
-            status = "PASSED" if passed else "DID NOT PASS"
+            status = "PASSED" if r["passed"] else "DID NOT PASS"
             lines.append(f"Level {r['level']} - {r['question']} - {status} (score {r['score']}/100) - grader feedback: {r['feedback']}")
         attempts_text = "\n".join(lines)
     else:
         attempts_text = "This candidate has not attempted any interview questions from this company yet."
 
-    recommended_skills = company.get("recommended_skills", "").strip() or "Not specified by the company."
+    recommended_skills = (company.get("recommended_skills") or "").strip() or "Not specified by the company."
 
     prompt = f"""You are a supportive career coach helping a candidate prepare for a role at {company['company_name']}.
 
@@ -595,10 +600,10 @@ def build_resume():
         return jsonify({"error": "Company not found."}), 404
 
     attempts = student_results_for_company(g.user["id"], company_id)
-    passed_questions = [r["question"] for r in attempts if str(r["passed"]).strip().lower() == "true"]
+    passed_questions = [r["question"] for r in attempts if r["passed"]]
     demonstrated_text = "\n".join(f"- {q}" for q in passed_questions) if passed_questions else "None logged yet."
 
-    recommended_skills = company.get("recommended_skills", "").strip() or "Not specified by the company."
+    recommended_skills = (company.get("recommended_skills") or "").strip() or "Not specified by the company."
 
     prompt = f"""Write a clean, professional one-page resume in plain text for the following candidate,
 targeted at a role at {company['company_name']}.
@@ -634,6 +639,13 @@ provided, leave it out rather than making it up. Keep the whole resume under 400
 
 
 if __name__ == "__main__":
-    os.makedirs(DATA_DIR, exist_ok=True)
+    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=True, host="0.0.0.0", port=port)
+else:
+    # When running under gunicorn on Render, __main__ never executes, so
+    # make sure the tables exist as soon as the module is imported.
+    try:
+        init_db()
+    except Exception as e:
+        print(f"Warning: could not initialize database tables at import time: {e}")
