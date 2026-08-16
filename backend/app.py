@@ -45,7 +45,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me-in-production")
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 TOKEN_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 PASS_THRESHOLD = int(os.environ.get("PASS_THRESHOLD", "70"))
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
